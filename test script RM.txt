@@ -1,0 +1,210 @@
+import http from 'k6/http';
+import { sleep, check, group } from 'k6';
+import crypto from 'k6/crypto';
+import { Counter, Rate, Trend } from 'k6/metrics';
+import { htmlReport } from "https://raw.githubusercontent.com/benc-uk/k6-reporter/main/dist/bundle.js";
+
+// Custom RMG Metrics
+const depositLatencyTrend = new Trend('rmg_deposit_latency_ms');
+const withdrawalLatencyTrend = new Trend('rmg_withdrawal_latency_ms');
+const betPlacementSuccessRate = new Rate('rmg_bet_placement_success_rate');
+const regulatoryCheckTrend = new Trend('rmg_regulatory_check_ms');
+
+// Environment Configuration
+const BASE_URL = __ENV.BASE_URL || 'https://api-rmg.example.com/api/v1';
+const CLIENT_TYPE = __ENV.CLIENT_TYPE || 'web'; 
+const TEST_TYPE = __ENV.TEST_TYPE || 'stress';
+
+const SCENARIOS = {
+  smoke: {
+    executor: 'shared-iterations',
+    vus: 1,
+    iterations: 2,
+    maxDuration: '2m',
+  },
+  stress: {
+    executor: 'ramping-vus',
+    startVUs: 0,
+    stages: [
+      { duration: '2m', target: 50 },
+      { duration: '3m', target: 100 },
+      { duration: '5m', target: 250 },
+      { duration: '2m', target: 0 },
+    ],
+  },
+  spike: {
+    executor: 'ramping-vus',
+    startVUs: 0,
+    stages: [
+      { duration: '30s', target: 50 },
+      { duration: '1m', target: 400 },
+      { duration: '2m', target: 400 },
+      { duration: '1m', target: 0 },
+    ],
+  }
+};
+
+export const options = {
+  scenarios: {
+    default_scenario: SCENARIOS[TEST_TYPE] || SCENARIOS.stress,
+  },
+  thresholds: {
+    // Zero-tolerance policy for errors on RMG financial APIs
+    'http_req_failed': ['rate<0.005'], 
+    'http_req_duration': ['p(95)<800'],
+    'rmg_bet_placement_success_rate': ['rate>0.995'], 
+    'http_req_duration{group:::03_Deposits_and_Cashier}': ['p(95)<1000'],
+    'http_req_duration{group:::04_Withdrawals}': ['p(95)<1500'],
+  },
+};
+
+const DEBUG_LOG_LIMIT = 5;
+const debugLogCounts = {};
+
+function debugCheck(res, checkName, extra, acceptableErrors = []) {
+  let ok = res.status === 200 || res.status === 201;
+
+  if (!ok && acceptableErrors.length > 0) {
+    try {
+      const body = res.json();
+      const errName = body && (body.error || (body.errors && body.errors.error));
+      if (errName && acceptableErrors.includes(errName)) {
+        ok = true;
+      }
+    } catch (e) { /* non-JSON response */ }
+  }
+
+  const passed = check(res, { [checkName]: () => ok });
+
+  if (!ok) {
+    debugLogCounts[checkName] = (debugLogCounts[checkName] || 0) + 1;
+    if (debugLogCounts[checkName] <= DEBUG_LOG_LIMIT) {
+      console.error(
+        `[RMG CRITICAL FAIL] ${checkName} | Status: ${res.status} | URL: ${res.url} | ` +
+        `Body: ${(res.body || '').slice(0, 300)}`
+      );
+    }
+  }
+  return passed;
+}
+
+function getHeaders(token = null) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Client-Type': CLIENT_TYPE,
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
+}
+
+export function setup() {
+  const totalUsers = TEST_TYPE === 'smoke' ? 2 : 50;
+  const prefix = __ENV.RUN_PREFIX || `rmg_${crypto.hexEncode(crypto.randomBytes(3))}`;
+  const users = [];
+
+  console.log(`[SETUP RMG] Provisioning ${totalUsers} verified player accounts...`);
+
+  for (let i = 1; i <= totalUsers; i++) {
+    const userPayload = {
+      username: `${prefix}_player_${i}`,
+      email: `${prefix}_player_${i}@gaming.com`,
+      password: 'SecurePassword123!',
+      kycStatus: 'VERIFIED',
+    };
+
+    http.post(`${BASE_URL}/auth/register`, JSON.stringify(userPayload), { headers: getHeaders() });
+
+    const loginRes = http.post(`${BASE_URL}/auth/login`, JSON.stringify({
+      username: userPayload.username,
+      password: userPayload.password,
+    }), { headers: getHeaders() });
+
+    if (loginRes.status === 200) {
+      const token = loginRes.json('data.token') || loginRes.json('token');
+      const userId = loginRes.json('data.userId') || loginRes.json('userId') || i;
+      users.push({ ...userPayload, token, userId });
+    }
+    sleep(0.05);
+  }
+
+  return { users };
+}
+
+export default function (data) {
+  const currentVu = __VU;
+  const user = data.users[(currentVu - 1) % data.users.length];
+  const userHeaders = { headers: getHeaders(user.token) };
+
+
+  // GROUP 00: Authentication & KYC Verification
+  group('00_Authentication_and_KYC', function () {
+    const kycRes = http.get(`${BASE_URL}/player/kyc-status`, userHeaders);
+    if (debugCheck(kycRes, 'KYC Status Passed')) {
+      regulatoryCheckTrend.add(kycRes.timings.duration);
+    }
+  });
+
+
+  // GROUP 01: Real Balance Sync
+  group('01_Real_Money_Balance', function () {
+    const walletRes = http.get(`${BASE_URL}/wallet/real-balance`, userHeaders);
+    debugCheck(walletRes, 'Real Cash Balance Synchronized');
+  });
+
+
+  // GROUP 02: Real Money Wagering / Game Engine
+  group('02_Real_Money_Wager', function () {
+    const wagerPayload = JSON.stringify({
+      gameId: 'rmg_blackjack_single_deck',
+      wagerAmount: 5.00, // Real currency transaction
+      currency: 'USD',
+    });
+
+    const wagerRes = http.post(`${BASE_URL}/casino/wager`, wagerPayload, userHeaders);
+    const wagerPassed = debugCheck(wagerRes, 'Real Money Wager Processed', null, ['InsufficientFunds']);
+    betPlacementSuccessRate.add(wagerPassed);
+    
+    sleep(Math.random() * 1.5 + 1);
+  });
+
+  // GROUP 03: Cashier & Deposit Integration
+  if (Math.random() < 0.10) { // 10% of iterations test payment gateway submission
+    group('03_Deposits_and_Cashier', function () {
+      const depositPayload = JSON.stringify({
+        amount: 50.00,
+        currency: 'USD',
+        paymentGateway: 'stripe_mock',
+      });
+
+      const depRes = http.post(`${BASE_URL}/cashier/deposit`, depositPayload, userHeaders);
+      if (debugCheck(depRes, 'Deposit Executed')) {
+        depositLatencyTrend.add(depRes.timings.duration);
+      }
+    });
+  }
+
+  // GROUP 04: Real Money Cashouts / Withdrawals
+  if (Math.random() < 0.03) { // 3% of iterations test withdrawal calls
+    group('04_Withdrawals', function () {
+      const withdrawPayload = JSON.stringify({
+        amount: 25.00,
+        destinationAccount: 'bank_account_mock',
+      });
+
+      const withdrawRes = http.post(`${BASE_URL}/cashier/withdraw`, withdrawPayload, userHeaders);
+      if (debugCheck(withdrawRes, 'Withdrawal Requested', null, ['InsufficientBalance'])) {
+        withdrawalLatencyTrend.add(withdrawRes.timings.duration);
+      }
+    });
+  }
+
+  sleep(Math.random() * 2 + 1);
+}
+
+
+export function handleSummary(data) {
+  return {
+    'RMG load test report.html': htmlReport(data),
+    stdout: textSummary(data, { indent: ' ', enableColors: true }),
+  };
+}

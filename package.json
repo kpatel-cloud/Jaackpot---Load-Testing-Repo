@@ -1,0 +1,9 @@
+{
+  "devDependencies": {
+    "pdf-parse": "^2.4.5"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^6.2.108",
+    "pdfkit": "^0.20.1"
+  }
+}
